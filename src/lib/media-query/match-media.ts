@@ -5,42 +5,83 @@
  * Use of this source code is governed by an MIT-style license that can be
  * found in the LICENSE file at https://angular.io/license
  */
-import {
-  Inject,
-  Injectable,
-  NgZone,
-  PLATFORM_ID,
-  RendererFactory2,
-  RendererType2,
-  ViewEncapsulation,
-} from '@angular/core';
+import {Inject, Injectable, NgZone, PLATFORM_ID} from '@angular/core';
 import {DOCUMENT, isPlatformBrowser} from '@angular/common';
 import {BehaviorSubject} from 'rxjs/BehaviorSubject';
 import {Observable} from 'rxjs/Observable';
 import {filter} from 'rxjs/operators/filter';
 
 import {MediaChange} from './media-change';
+import {BreakPoint} from '../media-query/breakpoints/break-point';
 
 /**
- * EventHandler callback with the mediaQuery [range] activates or deactivates
+ * Special server-only class to simulate a MediaQueryList and
+ * - supports manual activation to simulate mediaQuery matching
+ * - manages listeners
  */
-export interface MediaQueryListListener {
-  // Function with Window's MediaQueryList argument
-  (mql: MediaQueryList): void;
+export class ServerMediaQueryList implements MediaQueryList {
+  private _isActive = false;
+  private _listeners: Array<MediaQueryListListener> = [];
+
+  get matches(): boolean {
+    return this._isActive;
+  }
+
+  get media(): string {
+    return this._mediaQuery;
+  }
+
+  constructor(private _mediaQuery: string) { }
+
+  /**
+   *
+   */
+  destroy() {
+    this.deactivate();
+    this._listeners = [];
+  }
+
+  /**
+   * Notify all listeners that 'matches === TRUE'
+   */
+  activate(): ServerMediaQueryList {
+    if (!this._isActive) {
+      this._isActive = true;
+      this._listeners.forEach((callback) => {
+        callback(this);
+      });
+    }
+    return this;
+  }
+
+  /**
+   * Notify all listeners that 'matches === false'
+   */
+  deactivate(): ServerMediaQueryList {
+    if (this._isActive) {
+      this._isActive = false;
+      this._listeners.forEach((callback) => {
+        callback(this);
+      });
+    }
+    return this;
+  }
+
+  /**
+   *
+   */
+  addListener(listener: MediaQueryListListener) {
+    if (this._listeners.indexOf(listener) === -1) {
+      this._listeners.push(listener);
+    }
+    if (this._isActive) {
+      listener(this);
+    }
+  }
+
+  removeListener(_: MediaQueryListListener) {
+  }
 }
-
-/**
- * EventDispatcher for a specific mediaQuery [range]
- */
-export interface MediaQueryList {
-  readonly matches: boolean;
-  readonly media: string;
-
-  addListener(listener: MediaQueryListListener): void;
-
-  removeListener(listener: MediaQueryListListener): void;
-}
-
 
 /**
  * MediaMonitor configures listeners to mediaQuery changes and publishes an Observable facade to
@@ -51,17 +92,34 @@ export interface MediaQueryList {
  */
 @Injectable()
 export class MatchMedia {
-  protected _registry: Map<string, MediaQueryList>;
+  protected _registry: Map<string, MediaQueryList|ServerMediaQueryList>;
   protected _source: BehaviorSubject<MediaChange>;
   protected _observable$: Observable<MediaChange>;
 
   constructor(protected _zone: NgZone,
-              protected _rendererFactory: RendererFactory2,
               @Inject(DOCUMENT) protected _document: any,
               @Inject(PLATFORM_ID) protected _platformId: Object) {
-    this._registry = new Map<string, MediaQueryList>();
+    this._registry = new Map<string, MediaQueryList|ServerMediaQueryList>();
     this._source = new BehaviorSubject<MediaChange>(new MediaChange(true));
     this._observable$ = this._source.asObservable();
+  }
+
+  /**
+   * Activate the specified breakpoint if we're on the server, no-op otherwise
+   */
+  activateBreakpoint(bp: BreakPoint) {
+    if (!isPlatformBrowser(this._platformId)) {
+      (this._registry.get(bp.mediaQuery) as ServerMediaQueryList).activate();
+    }
+  }
+
+  /**
+   * Deactivate the specified breakpoint if we're on the server, no-op otherwise
+   */
+  deactivateBreakpoint(bp: BreakPoint) {
+    if (!isPlatformBrowser(this._platformId)) {
+      (this._registry.get(bp.mediaQuery) as ServerMediaQueryList).deactivate();
+    }
   }
 
   /**
@@ -104,7 +162,7 @@ export class MatchMedia {
 
       list.forEach(query => {
         let mql = this._registry.get(query);
-        let onMQLEvent = (e: MediaQueryList) => {
+        let onMQLEvent = (e: MediaQueryList|ServerMediaQueryList) => {
           this._zone.run(() => {
             let change = new MediaChange(e.matches, query);
             this._source.next(change);
@@ -128,18 +186,11 @@ export class MatchMedia {
    * Call window.matchMedia() to build a MediaQueryList; which
    * supports 0..n listeners for activation/deactivation
    */
-  protected _buildMQL(query: string): MediaQueryList {
+  protected _buildMQL(query: string): MediaQueryList|ServerMediaQueryList {
     let canListen = isPlatformBrowser(this._platformId) &&
       !!(<any>window).matchMedia('all').addListener;
 
-    return canListen ? (<any>window).matchMedia(query) : <MediaQueryList>{
-      matches: query === 'all' || query === '',
-      media: query,
-      addListener: () => {
-      },
-      removeListener: () => {
-      }
-    };
+    return canListen ? (<any>window).matchMedia(query) : new ServerMediaQueryList(query);
   }
 
   /**
@@ -149,16 +200,15 @@ export class MatchMedia {
    * @param query string The mediaQuery used to create a faux CSS selector
    *
    */
-  protected _prepareQueryCSS(mediaQueries: string[], _document: any) {
+  protected _prepareQueryCSS(mediaQueries: string[], _document: Document) {
     let list = mediaQueries.filter(it => !ALL_STYLES[it]);
     if (list.length > 0) {
       let query = list.join(', ');
 
       try {
-        const renderer = this._rendererFactory.createRenderer(_document, RENDERER_TYPE);
-        let styleEl = renderer.createElement('style');
+        let styleEl = _document.createElement('style');
 
-        renderer.setAttribute(styleEl, 'type', 'text/css');
+        styleEl.setAttribute('type', 'text/css');
         if (!styleEl['styleSheet']) {
           let cssText = `
 /*
@@ -167,10 +217,10 @@ export class MatchMedia {
 */
 @media ${query} {.fx-query-test{ }}
 ` ;
-          renderer.appendChild(styleEl, renderer.createText(cssText));
+          styleEl.appendChild(_document.createTextNode(cssText));
         }
 
-        renderer.appendChild(_document.head, styleEl);
+        _document.head.appendChild(styleEl);
 
         // Store in private global registry
         list.forEach(mq => ALL_STYLES[mq] = styleEl);
@@ -181,19 +231,6 @@ export class MatchMedia {
     }
   }
 }
-
-/**
- * Since `getDom()` is no longer supported,
- * we will use a RendererFactory build and instance
- * of a renderer for an element. Then the renderer will
- * build the stylesheet(s)
- */
-const RENDERER_TYPE: RendererType2 = {
-  id: '-1',
-  styles: [ ],
-  data: { },
-  encapsulation: ViewEncapsulation.None
-};
 
 /**
  * Private global registry for all dynamically-created, injected style tags
